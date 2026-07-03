@@ -35,6 +35,7 @@ DOCUMENTATION
 
     Conf_open
       Opens a Lua file and returns a Conf handle.
+      Supports both global-assignment and return-table style config files.
       Returns CONF_OK on success, CONF_NOTFOUND on failure.
 
     Conf_get_num
@@ -47,6 +48,23 @@ DOCUMENTATION
       Only Lua integer values are accepted (floats are rejected).
       Returns CONF_OK on success, CONF_UNDEF if a key in the path is missing,
       CONF_INVALID if the value is a float or a non-number.
+
+    Conf_get_len
+      Returns the length of an array-like Lua table at the given path.
+      Returns CONF_OK on success, CONF_UNDEF if a key is missing, CONF_INVALID
+      if the value at the path is not a table.
+
+    Conf_get_elem_num, Conf_get_elem_int, Conf_get_elem_str, Conf_get_elem_bool
+      Shortcuts for accessing an element at a numeric index within a table,
+      with an optional sub-field.  Equivalent to indexing the table with
+      the given integer index and then (if field is not NULL) following the
+      field path into that element.
+      The 'name' is a dot-separated path to the list table.
+      'index' is a 1-based integer index into that table.
+      'field' is an optional dot-separated sub-path inside the element,
+      or NULL if the element itself is the value.
+      Returns CONF_OK on success, CONF_UNDEF if a key is missing, CONF_INVALID
+      if a type mismatch occurs.
 
     Conf_get_str
       Reads a string value from the loaded config using a dot-separated path.
@@ -75,11 +93,16 @@ DOCUMENTATION
   Path syntax:
 
     The 'name' parameter in Conf_get_* is a dot-separated sequence of
-    identifiers. Each dot descends into a Lua table field.
+    identifiers and numeric indices. Each dot descends into a Lua table
+    field or indexes an array element.
 
     Example: given this Lua config --
       Table = { foo = { bar = 1 } }
     -- the path "Table.foo.bar" yields the value 1.
+
+    Numeric path segments index array elements:
+      List = { { x = 10 }, { x = 20 } }
+    -- "List.2.x" yields 20.
 
 NOTES
 
@@ -139,6 +162,11 @@ int Conf_get_num(Conf conf, char *name, double *val);      // Store the numeric 
 int Conf_get_str(Conf conf, char *name, const char **val); // Store the string value at 'name' into 'val'
 int Conf_get_bool(Conf conf, char *name, int *val);        // Store the boolean value at 'name' into 'val'
 int Conf_get_int(Conf conf, char *name, long long *val);   // Store the integer value at 'name' into 'val' (rejects floats)
+int Conf_get_len(Conf conf, char *name, int *len);         // Store the array length at 'name' into 'len'
+int Conf_get_elem_num(Conf conf, char *name, int index, char *field, double *val);
+int Conf_get_elem_int(Conf conf, char *name, int index, char *field, long long *val);
+int Conf_get_elem_str(Conf conf, char *name, int index, char *field, const char **val);
+int Conf_get_elem_bool(Conf conf, char *name, int index, char *field, int *val);
 int Conf_close(Conf conf);                                 // Release all resources held by 'conf'
 
 #if defined(INCLUDE_CONF_IMPLEMENTATION)
@@ -148,7 +176,7 @@ struct __conf {
         unsigned char do_not_load_stdlib : 1;
 };
 
-// Traverse a dot-separated path and leave the final value on the Lua stack.
+// Traverse a dot-separated path (supports numeric indices) and leave the final value on the Lua stack.
 // Returns the Lua type of the final value on success (positive),
 // or a negative error code ( -(CONF_UNDEF) or -(CONF_INVALID) ) on failure.
 // On success the caller must pop the value from the stack.
@@ -161,6 +189,8 @@ conf_traverse(lua_State *L, char *path)
         char *next = strtok_r(NULL, ".", &save);
         int base = lua_gettop(L);
         int ret;
+        long idx;
+        char *endptr;
 
         lua_getglobal(L, part);
         if (lua_isnil(L, -1)) {
@@ -171,15 +201,19 @@ conf_traverse(lua_State *L, char *path)
         while (next) {
                 part = next;
                 next = strtok_r(NULL, ".", &save);
-                lua_getfield(L, -1, part);
+                if (!lua_istable(L, -1)) {
+                        ret = -(CONF_INVALID);
+                        goto cleanup;
+                }
+                idx = strtol(part, &endptr, 10);
+                if (*endptr == '\0' && endptr != part)
+                        lua_geti(L, -1, idx);
+                else
+                        lua_getfield(L, -1, part);
                 lua_remove(L, -2); // pop the table, keep the field value
 
                 if (lua_isnil(L, -1)) {
                         ret = -(CONF_UNDEF);
-                        goto cleanup;
-                }
-                if (next && !lua_istable(L, -1)) {
-                        ret = -(CONF_INVALID);
                         goto cleanup;
                 }
         }
@@ -204,6 +238,21 @@ Conf_open(Conf *conf, char *filename)
         if (c->L == NULL) goto err;
         if (!c->do_not_load_stdlib) luaL_openlibs(c->L);
         if (luaL_dofile(c->L, filename) != LUA_OK) goto err;
+        /* if the chunk returned a table, lift its entries to globals */
+        if (lua_gettop(c->L) >= 1 && lua_istable(c->L, -1)) {
+                lua_pushnil(c->L);
+                while (lua_next(c->L, -2) != 0) {
+                        /* stack: table, key, value */
+                        if (lua_type(c->L, -2) == LUA_TSTRING) {
+                                const char *k = lua_tostring(c->L, -2);
+                                lua_setglobal(c->L, k);  /* pops value, sets global */
+                        } else {
+                                lua_pop(c->L, 1);        /* pop value, keep key */
+                        }
+                }
+        }
+        if (lua_gettop(c->L) >= 1)
+                lua_pop(c->L, 1);
         return CONF_OK;
 err:
         Conf_close(c);
@@ -273,6 +322,63 @@ Conf_get_int(Conf conf, char *name, long long *val)
         *val = (long long) lua_tointeger(conf->L, -1);
         lua_pop(conf->L, 1);
         return CONF_OK;
+}
+
+int
+Conf_get_len(Conf conf, char *name, int *len)
+{
+        int type = conf_traverse(conf->L, name);
+        if (type < 0) return -type;
+        if (type != LUA_TTABLE) {
+                lua_pop(conf->L, 1);
+                return CONF_INVALID;
+        }
+        *len = (int) lua_rawlen(conf->L, -1);
+        lua_pop(conf->L, 1);
+        return CONF_OK;
+}
+
+static int
+conf_elem_path(char *buf, size_t size, char *name, int index, char *field)
+{
+        int n;
+        if (field)
+                n = snprintf(buf, size, "%s.%d.%s", name, index, field);
+        else
+                n = snprintf(buf, size, "%s.%d", name, index);
+        return n < 0 || (size_t) n >= size ? CONF_INVALID : CONF_OK;
+}
+
+int
+Conf_get_elem_num(Conf conf, char *name, int index, char *field, double *val)
+{
+        char path[1024];
+        int ret = conf_elem_path(path, sizeof(path), name, index, field);
+        return ret != CONF_OK ? ret : Conf_get_num(conf, path, val);
+}
+
+int
+Conf_get_elem_int(Conf conf, char *name, int index, char *field, long long *val)
+{
+        char path[1024];
+        int ret = conf_elem_path(path, sizeof(path), name, index, field);
+        return ret != CONF_OK ? ret : Conf_get_int(conf, path, val);
+}
+
+int
+Conf_get_elem_str(Conf conf, char *name, int index, char *field, const char **val)
+{
+        char path[1024];
+        int ret = conf_elem_path(path, sizeof(path), name, index, field);
+        return ret != CONF_OK ? ret : Conf_get_str(conf, path, val);
+}
+
+int
+Conf_get_elem_bool(Conf conf, char *name, int index, char *field, int *val)
+{
+        char path[1024];
+        int ret = conf_elem_path(path, sizeof(path), name, index, field);
+        return ret != CONF_OK ? ret : Conf_get_bool(conf, path, val);
 }
 
 #endif
