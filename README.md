@@ -34,7 +34,7 @@ Conf_close(conf);
 
 ## Integration
 
-Copy `conf.h` into your project. In exactly **one** C/C++ file:
+Copy `conf.h` into your project. In exactly one C/C++ file:
 
 ```c
 #define INCLUDE_CONF_IMPLEMENTATION

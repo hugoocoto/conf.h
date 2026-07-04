@@ -41,7 +41,7 @@ jobs:
         uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
-          prepare: pkg install -y curl gmake
+          prepare: pkg install -y curl gmake gcc
           run: |
             curl -L -R -O https://www.lua.org/ftp/lua-5.5.0.tar.gz
             tar zxf lua-5.5.0.tar.gz
